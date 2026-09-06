@@ -1,0 +1,21 @@
+﻿brand,category,nominal_identity_matches,runtime_category_accepted,discarded_by_category
+Farmacias Guadalajara,clinica,1,NO,1
+Farmacias Guadalajara,conveniencia,2,NO,2
+Farmacias Guadalajara,farmacia,2956,YES,0
+McDonald's,clinica,1,NO,1
+McDonald's,fast_food,405,YES,0
+McDonald's,restaurantes,5,YES,0
+OXXO,autoservicio,23516,YES,0
+OXXO,central_autobuses,1,NO,1
+OXXO,conveniencia,43,YES,0
+OXXO,farmacia,1,NO,1
+OXXO,fast_food,10,NO,10
+OXXO,gasolinera,536,NO,535
+OXXO,mercado,2,NO,2
+OXXO,otros_combustibles,1,NO,1
+OXXO,restaurantes,1,NO,1
+Starbucks,fast_food,907,YES,0
+Starbucks,restaurantes,7,YES,0
+Tiendas 3B,autoservicio,2195,YES,0
+Tiendas 3B,conveniencia,72,YES,0
+Tiendas 3B,farmacia,2,NO,2
