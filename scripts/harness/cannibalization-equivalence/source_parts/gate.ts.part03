@@ -1,0 +1,115 @@
+    if (existsSync(fp)) obj = JSON.parse(readFileSync(fp, "utf8"));
+    else if (existsSync(miss) || !this.baseUrl) obj = {};
+    else {
+      const root = this.baseUrl.endsWith("/") ? this.baseUrl : this.baseUrl + "/";
+      const suffix = this.version ? `?v=${encodeURIComponent(this.version)}` : "";
+      const url = `${root}${cid}.json${suffix}`;
+      let ok = false, last = "";
+      for (let attempt = 1; attempt <= 5 && !ok; attempt++) {
+        try {
+          const res = await fetch(url, { method: "GET", headers: { "Cache-Control": "no-cache" } });
+          if (res.status === 404) { atomicWrite(miss, "404\n"); obj = {}; ok = true; break; }
+          if (!res.ok) { last = `HTTP ${res.status}`; if (![408,425,429,500,502,503,504].includes(res.status)) break; }
+          else { const text = await res.text(); obj = JSON.parse(text); atomicWrite(fp, text); ok = true; break; }
+        } catch (e: any) { last = String(e?.message ?? e); }
+        await new Promise(r => setTimeout(r, Math.min(5000, 300 * 2 ** (attempt - 1))));
+      }
+      if (!ok) die(`employee GET failed ${cid}: ${last}`);
+    }
+    const m = new Map<string, number>();
+    if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+      for (const [id, v] of Object.entries(obj)) { const n = Number(v); if (Number.isFinite(n)) m.set(id, n); }
+    }
+    this.mem.set(cid, m); return m;
+  }
+  async merged(cids: string[]): Promise<Map<string, number>> {
+    const maps = await Promise.all(cids.map(cid => this.cell(cid)));
+    const out = new Map<string, number>();
+    for (const m of maps) for (const [id,n] of m) out.set(id,n);
+    return out;
+  }
+  auditRows(): Record<string, any>[] {
+    const rows: Record<string, any>[] = [];
+    for (const name of readdirSync(this.dir).sort()) {
+      const p = path.join(this.dir, name);
+      rows.push({ file: name, sha256: shaFile(p), bytes: readFileSync(p).byteLength, state: name.endsWith(".missing") ? "HTTP_404" : "HTTP_200" });
+    }
+    return rows;
+  }
+}
+
+function nameOnlyMatch(rt: Runtime, brand: string, p: Poi): boolean { return rt.matchBrand(brand, { name: p.name ?? null, brand: null }); }
+function fullMatch(rt: Runtime, brand: string, p: Poi): boolean { return rt.matchBrand(brand, p); }
+
+function brandMatches(rt: Runtime, cleaned: Poi[], target: typeof TARGETS[number], nameOnly = false): Poi[] {
+  const pool = rt.getBrandSearchPois(cleaned, target.opportunity, target.brand);
+  return pool.filter(p => nameOnly ? nameOnlyMatch(rt, target.brand, p) : fullMatch(rt, target.brand, p));
+}
+
+function setDelta(a: Set<string>, b: Set<string>) {
+  const aOnly = [...a].filter(x => !b.has(x)).sort();
+  const bOnly = [...b].filter(x => !a.has(x)).sort();
+  const inter = [...a].filter(x => b.has(x)).sort();
+  return { aOnly, bOnly, inter };
+}
+
+function densityProxy(p: Poi, density: Map<string, number>): number {
+  const iy = Math.floor(p.lat / DENSITY_GRID_DEG), ix = Math.floor(p.lng / DENSITY_GRID_DEG);
+  let n = 0;
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) n += density.get(`${iy+dy}:${ix+dx}`) ?? 0;
+  return n;
+}
+
+type Unit = { unitId: string; brand: string; opportunity: string; entityId: string | null; members: Poi[]; densityProxy: number; densityProxyMin: number; densityProxyMax: number; densityStratum?: string; nearestM?: number | null; counts?: Record<string, number>; };
+
+function buildUnits(rt: Runtime, matches: Map<string, Poi>, target: typeof TARGETS[number], entityById: Map<string,string>, density: Map<string,number>): { units: Unit[]; audit: any; shadow3b?: any } {
+  const overlayAllowed = rt.isIdentityEntityMapOpportunity(target.opportunity);
+  if (overlayAllowed !== target.identityOverlay) die(`identity scope drift for ${target.brand}: runtime=${overlayAllowed} expected=${target.identityOverlay}`);
+  const groups = new Map<string, { entityId: string | null; members: Poi[] }>();
+  let mappedIds = 0;
+  for (const p of matches.values()) {
+    const eid = target.identityOverlay && p.source === "DENUE" ? (entityById.get(p.id) ?? null) : null;
+    if (eid) mappedIds++;
+    const key = eid ? `entity:${eid}` : `raw:${p.id}`;
+    const g = groups.get(key) ?? { entityId: eid, members: [] };
+    g.members.push(p); groups.set(key, g);
+  }
+  const units: Unit[] = [];
+  for (const [unitId, g] of groups) {
+    const proxies = g.members.map(p => densityProxy(p, density));
+    units.push({ unitId, brand: target.brand, opportunity: target.opportunity, entityId: g.entityId, members: g.members, densityProxy: median(proxies), densityProxyMin: Math.min(...proxies), densityProxyMax: Math.max(...proxies) });
+  }
+  let shadow3b: any = undefined;
+  if (!target.identityOverlay) {
+    const shadow = new Set<string>(); let shadowMapped = 0;
+    for (const p of matches.values()) {
+      const eid = p.source === "DENUE" ? entityById.get(p.id) : undefined;
+      if (eid) shadowMapped++;
+      shadow.add(eid ? `entity:${eid}` : `raw:${p.id}`);
+    }
+    shadow3b = { label: "SHADOW_ONLY_NOT_RUNTIME", raw_units: matches.size, mapped_ids: shadowMapped, shadow_units_if_overlay_extended: shadow.size };
+  }
+  return { units, audit: { brand: target.brand, opportunity: target.opportunity, overlay_runtime: target.identityOverlay, post_dedupe_matches: matches.size, mapped_ids: mappedIds, runtime_count_units: units.length, collapsed_rows: matches.size - units.length }, shadow3b };
+}
+
+function pairDistance(rt: Runtime, a: Unit, b: Unit): number {
+  let best = Infinity;
+  for (const x of a.members) for (const y of b.members) best = Math.min(best, rt.haversineDistance(x.lat, x.lng, y.lat, y.lng));
+  return best;
+}
+
+function computeSpacing(rt: Runtime, units: Unit[]): { rows: Record<string, any>[]; collisions: Record<string, any>[] } {
+  const memberGrid = new Map<string, Set<number>>();
+  units.forEach((u, ui) => u.members.forEach(p => {
+    const k = gridKey(p.lat, p.lng, NEIGHBOR_GRID_DEG);
+    const s = memberGrid.get(k) ?? new Set<number>(); s.add(ui); memberGrid.set(k, s);
+  }));
+  const collisions: Record<string, any>[] = [];
+  const seenPairs = new Set<string>();
+  const rows: Record<string, any>[] = [];
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i]; const cand = new Set<number>();
+    for (const p of u.members) {
+      const iy = Math.floor(p.lat / NEIGHBOR_GRID_DEG), ix = Math.floor(p.lng / NEIGHBOR_GRID_DEG);
+      for (let dy=-3;dy<=3;dy++) for (let dx=-3;dx<=3;dx++) for (const j of memberGrid.get(`${iy+dy}:${ix+dx}`) ?? []) if (j !== i) cand.add(j);
+    }

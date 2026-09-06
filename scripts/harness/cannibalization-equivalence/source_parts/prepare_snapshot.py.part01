@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LANTIVO — CANIBALIZATION EQUIVALENCE GATE V1 — SNAPSHOT PREPARE
+
+READ-ONLY against every authoritative remote source.
+LOCAL writes are limited to the chosen --out-dir.
+
+Preferred mode (local-certified): reconstructs the ACTIVE immutable C2 Radar base
+without re-downloading ~20k cells, using the exact historical source staging plus
+41 C2 candidate cells that were authenticated during C2 APPLY. Every local source
+cell is re-hashed against the historical checkpoint DB; all 41 candidates are
+re-hashed against the frozen C2 inventory. Public manifest + _SUCCESS + identity
+sidecar are GET-verified so the reconstruction is tied to the active data plane.
+
+Fallback mode (public-snapshot): GETs the active public cells checkpointed/resumable.
+It still needs a trusted cell keyset from the historical source staging/checkpoint
+or --cell-list. No remote write method exists in this script.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+SCRIPT_VERSION = "CANNIBALIZATION_EQUIVALENCE_GATE_V1_SNAPSHOT_PREPARE"
+
+EXPECTED_BASE_VERSION = "2026-09-05-base-c2-v1"
+EXPECTED_BASE_URL = "https://datos.lantivo.app/radar/mx/2026-09-05-base-c2-v1/cells/"
+PUBLIC_MANIFEST_URL = "https://datos.lantivo.app/radar/mx/manifest.json"
+PUBLIC_SUCCESS_URL = "https://datos.lantivo.app/radar/mx/2026-09-05-base-c2-v1/_SUCCESS.json"
+EXPECTED_SUCCESS_BYTES = 2215
+EXPECTED_SUCCESS_SHA256 = "d3c588903ab239649628bc8c23e041d72cc7f67e2b862fcef9dcaafd06566ebc"
+
+EXPECTED_IDENTITY_VERSION = "2026-08-30-day2-v1"
+EXPECTED_IDENTITY_URL = "https://datos.lantivo.app/radar/mx/identity/day2/entity_map_279c4d9df04113e4.json"
+EXPECTED_IDENTITY_SHA256 = "279c4d9df04113e4020cc4d312170a7a4a1cc06bfd5afc7a3969a191adfd9bc4"
+EXPECTED_IDENTITY_MEMBERS = 15_882
+EXPECTED_IDENTITY_ENTITIES = 7_941
+
+EXPECTED_BRAND_OVERRIDES_URL = None
+EXPECTED_CURATED_VERSION = "2026-07-21-vialnac-nacional-v1"
+EXPECTED_CURATED_URL = "https://datos.lantivo.app/radar/mx/2026-07/osm/cells/"
+
+EXPECTED_CELLS = 20_003
+EXPECTED_AFFECTED_CELLS = 41
+EXPECTED_RECOVERED = 9_193
+EXPECTED_OLD_AFFECTED_POIS = 19_347
+EXPECTED_NEW_AFFECTED_POIS = 28_540
+EXPECTED_POLANCO_CELL = "MX_971_-4960"
+EXPECTED_POLANCO_OLD = 15
+EXPECTED_POLANCO_RECOVERED = 951
+EXPECTED_POLANCO_NEW = 966
+
+PREPARE_REPORT_SHA256 = "501c9de14ef19d80b6484ee6bea77277b3f73d62f32fc8ad6c3aa461f28bd590"
+PREPARE_SUMMARY_SHA256 = "cf65ecc768a4176aa093b69ae8de0f7ce2eb3d1c55e1395fb7c31b9cdbd5357b"
+PREPARE_HASHES_SHA256 = "2521ec14407c4064964a56c68aa5211b5b1e6a89f0ff9c087ac358d9e66b5903"
+PREPARE_CELL_INVENTORY_SHA256 = "e8f41e8a8f4e907f19c5414125d0f935432353629b31dea449f907c46990304c"
+PREPARE_SETDIFF_SHA256 = "d184e6d6a12a84cc07739eb65cdf70284e7b78ea35514372e7164736e78cebd9"
+PREPARE_UNNAMED_SHA256 = "c33987601045db512282d076c301c8b482b720b2aa7a2e8b8e88ae79e956ac62"
+
+USER_AGENT = "Lantivo-Canibalization-Equivalence-Gate-Readonly/1.0"
+RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
+
+
+def die(msg: str, code: int = 2) -> None:
+    raise SystemExit(f"ABORT: {msg}")
+
+
+def log(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def sha256_bytes(body: bytes) -> str:
+    return hashlib.sha256(body).hexdigest().lower()
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def atomic_write(path: Path, body: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".partial")
+    tmp.write_bytes(body)
+    os.replace(tmp, path)
+
+
+def atomic_json(path: Path, obj: Any) -> None:
+    atomic_write(path, (json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+
+
+def http_get(url: str, attempts: int = 5, timeout: float = 30.0) -> bytes:
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "User-Agent": USER_AGENT,
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if getattr(r, "status", 200) != 200:
+                    raise RuntimeError(f"HTTP {getattr(r, 'status', '?')} {url}")
+                return r.read()
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in RETRYABLE_HTTP:
+                raise
+        except Exception as e:
+            last = e
+        if attempt < attempts:
+            time.sleep(min(8.0, 0.7 * (2 ** (attempt - 1))))
+    raise RuntimeError(f"GET failed after {attempts} attempts: {url}: {last}")
+
+
+def parse_json_bytes(body: bytes, label: str) -> dict[str, Any]:
+    try:
+        obj = json.loads(body.decode("utf-8-sig"))
+    except Exception as e:
+        die(f"invalid JSON {label}: {e}")
+    if not isinstance(obj, dict):
+        die(f"{label} is not a JSON object")
+    return obj
+
+
+def count_cell_pois(path: Path, expected_cell_id: str | None = None) -> int:
+    obj = parse_json_bytes(path.read_bytes(), str(path))
+    pois = obj.get("pois")
+    if not isinstance(pois, list):
+        die(f"cell {path.name} missing pois array")
+    if int(obj.get("poi_count", -1)) != len(pois):
+        die(f"cell {path.name} poi_count mismatch")
+    cid = obj.get("cell_id")
+    expected = expected_cell_id or path.stem
+    if cid != expected:
+        die(f"cell_id/path mismatch {path.name}: {cid!r} != {expected!r}")
+    return len(pois)
+
+
+def verify_file(path: Path, expected_sha: str) -> None:
+    if not path.is_file():
+        die(f"missing frozen file: {path}")
+    actual = sha256_file(path)
+    if actual != expected_sha:
+        die(f"frozen file SHA drift {path.name}: {actual} != {expected_sha}")
+
+
+def load_prepare_inventory(prep_dir: Path) -> dict[str, dict[str, Any]]:
+    report = prep_dir / "C2_BASE_REPAIR_PREPARE_V1_3_REPORT.json"
+    summary = prep_dir / "C2_BASE_REPAIR_PREPARE_V1_3_SUMMARY.txt"
+    hashes = prep_dir / "C2_BASE_REPAIR_PREPARE_V1_3_HASHES.txt"
+    inv_path = prep_dir / "C2_BASE_REPAIR_PREPARE_V1_3_CELL_INVENTORY.csv"

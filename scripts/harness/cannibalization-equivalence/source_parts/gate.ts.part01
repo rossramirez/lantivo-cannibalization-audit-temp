@@ -1,0 +1,120 @@
+#!/usr/bin/env bun
+/**
+ * LANTIVO — CANIBALIZATION POLICY — IDENTITY/DEDUP + FILTER EQUIVALENCE GATE V1
+ *
+ * AUDIT HARNESS ONLY. Imports the pinned production TypeScript as the semantic
+ * oracle. It never writes GitHub/R2/manifest/Supabase/Lovable and never modifies
+ * the runtime checkout. Network access is restricted to GET of the optional
+ * employee-cell lookup exposed by the already-snapshotted manifest; GET results
+ * are cached locally and hashed in the final evidence.
+ *
+ * Two explicit study constructions (NOT runtime claims):
+ *  1) Nationalization of runtime-local dedupe: tile the country by Radar home
+ *     cell, run the exact runtime pipeline on that cell's 5x5/2km window, and
+ *     retain only survivors whose home cell is the tile being emitted.
+ *  2) Entity↔entity spacing: MIN haversine over all surviving member pairs.
+ *
+ * Both are measured against a global relevant-name dedupe diagnostic. Any
+ * context-dependent delta is reported and blocks automatic policy calibration.
+ */
+
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync } from "node:fs";
+import { promises as fsp } from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const SCRIPT_VERSION = "CANNIBALIZATION_EQUIVALENCE_GATE_V1";
+const PINNED_HEAD = "9409214fb4d003d1a34d5348e5923113f0ef695d";
+const PINNED_TREE = "be68d7d2d105708eab1a8ab45702ae27d1430ae1";
+const EXPECTED_STORE_SHA = "8049764865d60ca48172dff2117b496846c947aa3a2b5d59df908c4b9d6ded39";
+const EXPECTED_STORE_ROWS = 30_073;
+const EXPECTED_IDENTITY_SHA = "279c4d9df04113e4020cc4d312170a7a4a1cc06bfd5afc7a3969a191adfd9bc4";
+const RADII = [250, 500, 800, 1000, 1500, 2000, 3000] as const;
+const RUNTIME_RADIUS_M = 2000;
+const DENSITY_GRID_DEG = 0.01;
+const NEIGHBOR_GRID_DEG = 0.02;
+
+const TARGETS = [
+  { brand: "OXXO", opportunity: "tiendas_conveniencia", expectedStudyN: 23_534, identityOverlay: true },
+  { brand: "Farmacias Guadalajara", opportunity: "farmacia", expectedStudyN: 2_956, identityOverlay: true },
+  { brand: "Tiendas 3B", opportunity: "tiendas_descuento", expectedStudyN: 2_267, identityOverlay: false },
+  { brand: "Starbucks", opportunity: "fast_food", expectedStudyN: 908, identityOverlay: true },
+  { brand: "McDonald's", opportunity: "fast_food", expectedStudyN: 408, identityOverlay: true },
+] as const;
+
+type Poi = Record<string, any> & { id: string; lat: number; lng: number; category: string; source?: string };
+type SnapshotCell = { cell_id: string; path: string; sha256: string; bytes: number; poi_count: number; provenance: string };
+type SnapshotIndex = {
+  schema: string;
+  active_base_version: string;
+  active_base_url: string;
+  authorities: { manifest: { path: string }; identity: { path: string; sha256: string } };
+  cells: SnapshotCell[];
+};
+
+type Args = { runtimeRoot: string; snapshotIndex: string; storeLevel: string; outDir: string };
+
+type Runtime = {
+  dedupeDenuePois: (pois: Poi[], thresholdM?: number, strongAddressThresholdM?: number) => Poi[];
+  normalizeExactName: (s: string | null | undefined) => string;
+  applyDenueCanonicalAuthority: (pois: Poi[]) => Poi[];
+  cleanCanonicalCompetitionPois: (pois: Poi[]) => Poi[];
+  getBrandSearchPois: (pois: Poi[], opportunity: string | null | undefined, targetBrand?: string | null) => Poi[];
+  matchBrand: (brand: string, poi: { name?: string | null; brand?: string | null }) => boolean;
+  parseIdentityEntityMapDocument: (v: unknown) => any | null;
+  isIdentityEntityMapOpportunity: (s: string | null | undefined) => boolean;
+  resolveCellsForPoint: (lat: number, lng: number, radiusM: number) => Array<{ id: string }>;
+  resolveHomeCell: (lat: number, lng: number) => { id: string; latIndex: number; lngIndex: number };
+  haversineDistance: (aLat: number, aLng: number, bLat: number, bLng: number) => number;
+  applyEmpleadosLookup: (pois: Poi[], lookup: Map<string, number>) => Poi[];
+};
+
+function die(msg: string): never { throw new Error(`ABORT: ${msg}`); }
+function log(msg = "") { console.log(msg); }
+function ensureDir(p: string) { mkdirSync(p, { recursive: true }); }
+function shaBytes(b: Buffer | string): string { return createHash("sha256").update(b).digest("hex"); }
+function shaFile(p: string): string { return shaBytes(readFileSync(p)); }
+function atomicWrite(p: string, body: string | Buffer) {
+  ensureDir(path.dirname(p));
+  const tmp = `${p}.partial`;
+  writeFileSync(tmp, body);
+  renameSync(tmp, p);
+}
+function atomicJson(p: string, value: any) { atomicWrite(p, JSON.stringify(value, null, 2) + "\n"); }
+
+function parseArgs(argv: string[]): Args {
+  const map = new Map<string, string>();
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") {
+      console.log(`Usage: bun gate.ts --runtime-root <lantivo-vf> --snapshot-index <SNAPSHOT_INDEX.json> --store-level <V1.3_STORE_LEVEL.csv> --out-dir <dir>`);
+      process.exit(0);
+    }
+    if (!a.startsWith("--")) die(`unexpected arg ${a}`);
+    const v = argv[++i];
+    if (!v) die(`missing value for ${a}`);
+    map.set(a, v);
+  }
+  const runtimeRoot = map.get("--runtime-root");
+  const snapshotIndex = map.get("--snapshot-index");
+  const storeLevel = map.get("--store-level");
+  const outDir = map.get("--out-dir");
+  if (!runtimeRoot || !snapshotIndex || !storeLevel || !outDir) die("required args missing; use --help");
+  return { runtimeRoot: path.resolve(runtimeRoot), snapshotIndex: path.resolve(snapshotIndex), storeLevel: path.resolve(storeLevel), outDir: path.resolve(outDir) };
+}
+
+function git(root: string, args: string[]): string {
+  return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+}
+
+const EXPECTED_BLOBS: Record<string, string> = {
+  "src/lib/dedupeDenuePois.ts": "41c289b9bd4eaf759011820029e012d1aaaffadd",
+  "src/lib/directCompetitionFilter.ts": "b500eb7fa58bafe615a72cf8ed47643bfb1ab0eb",
+  "src/lib/brandMatching.ts": "33c649441428413909455438fdf01d24ea0a267e",
+  "src/lib/identityEntityMap.ts": "4fb36c54e613c2863fbbe649294bb44d47055b60",
+  "src/lib/cellResolver.ts": "da4df6f658d51ff8d73eefbd489d1cd26fa3e25c",
+  "src/lib/haversineDistance.ts": "69a77d57dee9c8d6e1fe8d1a89914d5f7a5ae223",
+  "src/lib/denueCanonicalAuthority.ts": "ca619724f8880b17e2af89af93489fa5f8c3a388",
+  "src/lib/empleadosCellsService.ts": "f890587a2d9eb94e747dd34821b39bab6bb78464",

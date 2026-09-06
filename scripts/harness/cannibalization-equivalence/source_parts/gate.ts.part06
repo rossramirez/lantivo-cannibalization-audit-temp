@@ -1,0 +1,65 @@
+    const rr=spacingRows.filter(r=>r.brand===t.brand); brandSummary.push({brand:t.brand,opportunity:t.opportunity,identity_overlay_runtime:t.identityOverlay?"ON":"OFF",...aggregate(rr),distance_semantics:"STUDY_DERIVED_MIN_PAIRWISE_MEMBER_HAVERSINE",density_assignment_method:"STUDY_DERIVED_MEDIAN_OF_MEMBER_PROXIES"});
+    for (const st of ["Q1_baja","Q2_media_baja","Q3_media_alta","Q4_alta"]) { const ss=rr.filter(r=>r.density_stratum===st); if(ss.length) densitySummary.push({brand:t.brand,density_stratum:st,density_proxy_median:median(ss.map(r=>Number(r.density_proxy_3x3_001deg))),...aggregate(ss)}); }
+  }
+
+  // Detailed identity output one row per emitted unit/member set.
+  const identityRows=allUnits.map(u=>({brand:u.brand,unit_id:u.unitId,entity_id:u.entityId??"",member_count:u.members.length,member_ids:u.members.map(p=>p.id).sort().join("|"),overlay_runtime:u.opportunity==="tiendas_descuento"?"OFF":"ON"}));
+  const employeeAudit=employees.auditRows();
+
+  writeCsv(path.join(args.outDir,"STORE_LEVEL_RUNTIME_EQUIVALENT.csv"),spacingRows);
+  writeCsv(path.join(args.outDir,"BRAND_SUMMARY.csv"),brandSummary);
+  writeCsv(path.join(args.outDir,"DENSITY_STRATA.csv"),densitySummary);
+  writeCsv(path.join(args.outDir,"MATCH_DELTA.csv"),matchDeltaRows,["brand","side","id"]);
+  writeCsv(path.join(args.outDir,"FILTER_DELTA.csv"),filterDeltaRows,["brand","side","id"]);
+  writeCsv(path.join(args.outDir,"DEDUPE_AUDIT.csv"),dedupeAuditRows);
+  writeCsv(path.join(args.outDir,"DEDUPE_CONTEXT_DELTA.csv"),contextRows);
+  writeCsv(path.join(args.outDir,"IDENTITY_AUDIT.csv"),identityRows);
+  writeCsv(path.join(args.outDir,"COORDINATE_COLLISIONS.csv"),collisionRows);
+  writeCsv(path.join(args.outDir,"EMPLOYEE_CACHE_AUDIT.csv"),employeeAudit);
+
+  const report={
+    schema:"LANTIVO_CANNIBALIZATION_EQUIVALENCE_GATE_V1_REPORT",script_version:SCRIPT_VERSION,
+    verdict:contextDeltaTotal===0?"PASS_EQUIVALENCE_GATES_MEASURED":"REVIEW_REQUIRED_CONTEXT_DEPENDENCE",
+    calibration_ready_for_policy_design:contextDeltaTotal===0,
+    runtime_guards:guards,
+    source:{snapshot_index:args.snapshotIndex,store_level_sha256:EXPECTED_STORE_SHA,store_level_rows:storeRows.length,active_base_version:index.active_base_version,scanned_pois:scannedPois,scanned_denue:scannedDenue,nonbase_scope_guard:"brand_overrides=null + pinned curated vial-only producer/version"},
+    exact_runtime_order_used:["5x5 resolveCellsForPoint","2km distance filter","employee lookup","dedupeDenuePois Rule A+B","applyDenueCanonicalAuthority","cleanCanonicalCompetitionPois","getBrandSearchPois","matchBrand","identity overlay where certified"],
+    study_derived_semantics:{nationalization:"RADAR_HOME_CELL_TILING_WITH_RUNTIME_5x5_2KM_WINDOW",entity_to_entity_distance:"MIN_PAIRWISE_MEMBER_HAVERSINE",density_assignment:"MEDIAN_OF_MEMBER_DENSITY_PROXIES",warning:"These three are study constructions, not claims that runtime computes entity-to-entity spacing."},
+    gates:{
+      MATCH_EQUIVALENCE_GATE:{delta_rows:matchDeltaRows.length,meaning:"name-only study semantics vs runtime name+brand, pre-dedupe after current canonical filters"},
+      OUTLET_FILTER_EQUIVALENCE_GATE:{delta_rows:filterDeltaRows.length,meaning:"certified V1.3 STORE_LEVEL IDs vs current runtime filtered/name-only IDs; dedupe intentionally held out"},
+      DEDUPE_EQUIVALENCE_GATE:{context_delta_rows:contextRows.length,national_window_vs_global_symmetric_delta:contextDeltaTotal,window_home_cells:homes.length},
+      IDENTITY_GATE:{audit:identityAudit,tiendas_3b_shadow_only:shadow3b},
+      COORDINATE_COLLISION_GATE:{pairs_le_60m:collisionRows.length,rule:"MEASURE_ONLY_NEVER_MERGE_BY_COORDINATE"},
+      EMPLOYEE_SURVIVOR_GATE:{manifest_url:manifest.denue_empleados_cells_url??null,cached_cells:employeeAudit.length,method:"GET_ONLY_CACHED_AND_APPLIED_BEFORE_DEDUPE"},
+    },
+    density_quartile_cutpoints:{d25,d50,d75},brand_summary:brandSummary,
+    forbidden_writes:{r2:0,manifest:0,supabase:0,github:0,lovable:0,score:0,production_code:0},
+  };
+  atomicJson(path.join(args.outDir,"REPORT.json"),report);
+  const summary=[
+    `LANTIVO — ${SCRIPT_VERSION}`,
+    "=".repeat(96),
+    `VERDICT: ${report.verdict}`,
+    `CALIBRATION_READY_FOR_POLICY_DESIGN: ${report.calibration_ready_for_policy_design}`,
+    `RUNTIME HEAD: ${guards.head}`,
+    `STORE_LEVEL: ${storeRows.length.toLocaleString()} rows · ${EXPECTED_STORE_SHA}`,
+    `ACTIVE BASE: ${index.active_base_version}`,
+    `CANDIDATE HOME CELLS: ${homes.length.toLocaleString()}`,
+    `DEDUPE CONTEXT SYMMETRIC DELTA: ${contextDeltaTotal.toLocaleString()}`,
+    `MATCH DELTA ROWS: ${matchDeltaRows.length.toLocaleString()}`,
+    `FILTER DELTA ROWS: ${filterDeltaRows.length.toLocaleString()}`,
+    `COORDINATE COLLISION PAIRS <=60m: ${collisionRows.length.toLocaleString()}`,
+    "",
+    "DISTANCE SEMANTICS: STUDY_DERIVED_MIN_PAIRWISE_MEMBER_HAVERSINE",
+    "3B: runtime overlay OFF; any sidecar collapse appears only in shadow diagnostics.",
+    "NO calculateScore.ts / cannibalizationPolicy.ts / card / runtime writes were performed.",
+  ].join("\n")+"\n";
+  atomicWrite(path.join(args.outDir,"SUMMARY.txt"),summary);
+  const outputs=["REPORT.json","SUMMARY.txt","STORE_LEVEL_RUNTIME_EQUIVALENT.csv","BRAND_SUMMARY.csv","DENSITY_STRATA.csv","MATCH_DELTA.csv","FILTER_DELTA.csv","DEDUPE_AUDIT.csv","DEDUPE_CONTEXT_DELTA.csv","IDENTITY_AUDIT.csv","COORDINATE_COLLISIONS.csv","EMPLOYEE_CACHE_AUDIT.csv"];
+  hashOutputs(args.outDir,outputs);
+  log(summary);
+  log(`OUTPUT: ${args.outDir}`);
+}
+
+main().catch((e:any)=>{ console.error(e?.stack??e); process.exit(2); });

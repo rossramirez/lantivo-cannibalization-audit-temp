@@ -1,0 +1,133 @@
+            die(f"affected source cell missing: {cid}")
+        if (sx["sha256"], sx["bytes"], sx["poi_count"]) != (x["old_sha256"], x["old_bytes"], x["old_poi_count"]):
+            die(f"C2 baseline != historical source staging {cid}")
+    return out
+
+
+def verify_public_authorities(out_dir: Path) -> dict[str, Any]:
+    manifest_body = http_get(PUBLIC_MANIFEST_URL + "?gate=" + str(int(time.time())))
+    manifest = parse_json_bytes(manifest_body, "public manifest")
+    if manifest.get("base_version") != EXPECTED_BASE_VERSION:
+        die(f"active base_version={manifest.get('base_version')!r} != {EXPECTED_BASE_VERSION!r}")
+    if manifest.get("base_url") != EXPECTED_BASE_URL:
+        die(f"active base_url={manifest.get('base_url')!r} != expected")
+
+    # Non-base commercial-layer guard. The certified curated release is vial-only
+    # (carretera/vialidad_primaria/puente) and therefore cannot enter any of the
+    # five commercial brand-search category universes. A later curated/brand layer
+    # is a semantic change and must force a new audit, not silently enter this gate.
+    if manifest.get("brand_overrides_url") is not EXPECTED_BRAND_OVERRIDES_URL:
+        die(f"brand_overrides_url is now configured: {manifest.get('brand_overrides_url')!r}; new audit required")
+    if manifest.get("curated_version") != EXPECTED_CURATED_VERSION or manifest.get("curated_url") != EXPECTED_CURATED_URL:
+        die(
+            f"curated layer drift: version={manifest.get('curated_version')!r} "
+            f"url={manifest.get('curated_url')!r}; new audit required"
+        )
+
+    identity_url = manifest.get("identity_entity_map_url")
+    identity_version = manifest.get("identity_entity_map_version")
+    if identity_url != EXPECTED_IDENTITY_URL or identity_version != EXPECTED_IDENTITY_VERSION:
+        die(f"identity manifest drift url/version: {identity_url!r} / {identity_version!r}")
+
+    success_body = http_get(PUBLIC_SUCCESS_URL + "?gate=" + str(int(time.time())))
+    if len(success_body) != EXPECTED_SUCCESS_BYTES or sha256_bytes(success_body) != EXPECTED_SUCCESS_SHA256:
+        die("C2 _SUCCESS public bytes/SHA drift")
+
+    identity_body = http_get(EXPECTED_IDENTITY_URL + "?gate=" + str(int(time.time())))
+    if sha256_bytes(identity_body) != EXPECTED_IDENTITY_SHA256:
+        die("identity sidecar SHA drift")
+    identity = parse_json_bytes(identity_body, "identity sidecar")
+    if identity.get("version") != EXPECTED_IDENTITY_VERSION:
+        die("identity sidecar version drift")
+    if identity.get("policy") != "STRICT_DEGREE_ONE_NO_TRANSITIVITY":
+        die("identity sidecar policy drift")
+    if int(identity.get("member_count", -1)) != EXPECTED_IDENTITY_MEMBERS or int(identity.get("entity_count", -1)) != EXPECTED_IDENTITY_ENTITIES:
+        die("identity sidecar cardinality drift")
+    members = identity.get("members")
+    if not isinstance(members, dict) or len(members) != EXPECTED_IDENTITY_MEMBERS or len(set(members.values())) != EXPECTED_IDENTITY_ENTITIES:
+        die("identity sidecar members/entity cardinality drift")
+
+    manifest_path = out_dir / "LIVE_MANIFEST.json"
+    success_path = out_dir / "C2_SUCCESS.json"
+    identity_path = out_dir / "IDENTITY_ENTITY_MAP.json"
+    atomic_write(manifest_path, manifest_body)
+    atomic_write(success_path, success_body)
+    atomic_write(identity_path, identity_body)
+    return {
+        "manifest": {
+            "url": PUBLIC_MANIFEST_URL,
+            "path": str(manifest_path.resolve()),
+            "sha256": sha256_bytes(manifest_body),
+            "bytes": len(manifest_body),
+            "base_version": manifest["base_version"],
+            "base_url": manifest["base_url"],
+            "brand_overrides_url": manifest.get("brand_overrides_url"),
+            "curated_version": manifest.get("curated_version"),
+            "curated_url": manifest.get("curated_url"),
+            "nonbase_commercial_scope_guard": "PASS_BRAND_NULL_CURATED_VIAL_ONLY_PINNED_VERSION",
+        },
+        "success": {
+            "url": PUBLIC_SUCCESS_URL,
+            "path": str(success_path.resolve()),
+            "sha256": sha256_bytes(success_body),
+            "bytes": len(success_body),
+        },
+        "identity": {
+            "url": EXPECTED_IDENTITY_URL,
+            "path": str(identity_path.resolve()),
+            "sha256": sha256_bytes(identity_body),
+            "bytes": len(identity_body),
+            "version": identity["version"],
+            "member_count": identity["member_count"],
+            "entity_count": identity["entity_count"],
+        },
+    }
+
+
+def build_local_certified(root: Path, out_dir: Path) -> dict[str, Any]:
+    prep_dir = root / "C2_BASE_REPAIR_PREPARE_V1_3"
+    source_work = root / "GASOLINERAS_SCIAN_REBUILD_V1"
+    source_dir = source_work / "staging" / "cells"
+    source_db = source_work / "prepare.sqlite"
+
+    inv = load_prepare_inventory(prep_dir)
+    verify_candidate_cells(prep_dir, inv)
+    checkpoint = source_checkpoint_map(source_db)
+    source = verify_source_staging(source_dir, checkpoint, inv)
+
+    active = dict(source)
+    for cid, x in inv.items():
+        cp = prep_dir / "candidate_cells" / f"{cid}.json"
+        active[cid] = {
+            "cell_id": cid,
+            "path": str(cp.resolve()),
+            "sha256": x["candidate_sha256"],
+            "bytes": x["candidate_bytes"],
+            "poi_count": x["new_poi_count"],
+            "provenance": "C2_CANDIDATE_2026-09-05",
+        }
+
+    if len(active) != EXPECTED_CELLS:
+        die(f"active reconstructed cells={len(active)} != {EXPECTED_CELLS}")
+    if sum(1 for x in active.values() if x["provenance"].startswith("C2_CANDIDATE")) != EXPECTED_AFFECTED_CELLS:
+        die("active reconstructed affected-cell count drift")
+
+    authorities = verify_public_authorities(out_dir)
+    index = {
+        "schema": "LANTIVO_CANNIBALIZATION_EQUIVALENCE_SNAPSHOT_V1",
+        "script_version": SCRIPT_VERSION,
+        "mode": "local-certified",
+        "remote_access": "GET_ONLY",
+        "active_base_version": EXPECTED_BASE_VERSION,
+        "active_base_url": EXPECTED_BASE_URL,
+        "expected_cells": EXPECTED_CELLS,
+        "affected_cells": EXPECTED_AFFECTED_CELLS,
+        "recovered_pois": EXPECTED_RECOVERED,
+        "authorities": authorities,
+        "cells": [active[cid] for cid in sorted(active)],
+    }
+    return index
+
+
+def load_cell_names(root: Path, cell_list: Path | None) -> list[str]:
+    if cell_list:

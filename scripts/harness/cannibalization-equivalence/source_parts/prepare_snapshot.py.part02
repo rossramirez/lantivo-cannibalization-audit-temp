@@ -1,0 +1,136 @@
+    setdiff = prep_dir / "C2_BASE_REPAIR_PREPARE_V1_3_EXPECTED_SETDIFF.csv.gz"
+    unnamed = prep_dir / "C2_BASE_REPAIR_PREPARE_V1_3_UNNAMED_OFFICIAL.csv"
+    for p, s in (
+        (report, PREPARE_REPORT_SHA256),
+        (summary, PREPARE_SUMMARY_SHA256),
+        (hashes, PREPARE_HASHES_SHA256),
+        (inv_path, PREPARE_CELL_INVENTORY_SHA256),
+        (setdiff, PREPARE_SETDIFF_SHA256),
+        (unnamed, PREPARE_UNNAMED_SHA256),
+    ):
+        verify_file(p, s)
+
+    robj = parse_json_bytes(report.read_bytes(), "C2 PREPARE report")
+    if robj.get("prepare_pass") is not True or robj.get("verdict") != "GO_FOR_APPLY_DESIGN":
+        die("C2 PREPARE report is not certified GO_FOR_APPLY_DESIGN")
+
+    rows: dict[str, dict[str, Any]] = {}
+    with inv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        rd = csv.DictReader(f)
+        expected_cols = {
+            "cell_id", "old_poi_count", "recovered_count", "new_poi_count",
+            "old_sha256", "candidate_sha256", "old_bytes", "candidate_bytes",
+            "old_ids_preserved", "top_level_preserved_except_pois_poi_count", "setdiff_exact",
+        }
+        if set(rd.fieldnames or []) != expected_cols:
+            die(f"C2 inventory columns drift: {rd.fieldnames}")
+        for r in rd:
+            cid = str(r["cell_id"]).strip()
+            if not cid or cid in rows:
+                die(f"duplicate/blank C2 inventory cell_id {cid!r}")
+            if any(r[k] != "True" for k in ("old_ids_preserved", "top_level_preserved_except_pois_poi_count", "setdiff_exact")):
+                die(f"C2 inventory boolean guard false for {cid}")
+            rows[cid] = {
+                "cell_id": cid,
+                "old_poi_count": int(r["old_poi_count"]),
+                "recovered_count": int(r["recovered_count"]),
+                "new_poi_count": int(r["new_poi_count"]),
+                "old_sha256": str(r["old_sha256"]).lower(),
+                "candidate_sha256": str(r["candidate_sha256"]).lower(),
+                "old_bytes": int(r["old_bytes"]),
+                "candidate_bytes": int(r["candidate_bytes"]),
+            }
+    if len(rows) != EXPECTED_AFFECTED_CELLS:
+        die(f"C2 affected cells={len(rows)} != {EXPECTED_AFFECTED_CELLS}")
+    if sum(x["recovered_count"] for x in rows.values()) != EXPECTED_RECOVERED:
+        die("C2 recovered sum drift")
+    if sum(x["old_poi_count"] for x in rows.values()) != EXPECTED_OLD_AFFECTED_POIS:
+        die("C2 old affected POI sum drift")
+    if sum(x["new_poi_count"] for x in rows.values()) != EXPECTED_NEW_AFFECTED_POIS:
+        die("C2 new affected POI sum drift")
+    p = rows.get(EXPECTED_POLANCO_CELL)
+    if not p or (p["old_poi_count"], p["recovered_count"], p["new_poi_count"]) != (
+        EXPECTED_POLANCO_OLD, EXPECTED_POLANCO_RECOVERED, EXPECTED_POLANCO_NEW
+    ):
+        die("Polanco C2 inventory drift")
+    return rows
+
+
+def verify_candidate_cells(prep_dir: Path, inv: dict[str, dict[str, Any]]) -> None:
+    candidate_dir = prep_dir / "candidate_cells"
+    baseline_dir = prep_dir / "baseline_cells"
+    candidates = {p.stem: p for p in candidate_dir.glob("*.json")}
+    baselines = {p.stem: p for p in baseline_dir.glob("*.json")}
+    if set(candidates) != set(inv) or set(baselines) != set(inv):
+        die(f"candidate/baseline 41-file set drift: {len(candidates)}/{len(baselines)}")
+    for i, cid in enumerate(sorted(inv), 1):
+        x = inv[cid]
+        cp, bp = candidates[cid], baselines[cid]
+        if (sha256_file(cp), cp.stat().st_size) != (x["candidate_sha256"], x["candidate_bytes"]):
+            die(f"candidate drift {cid}")
+        if (sha256_file(bp), bp.stat().st_size) != (x["old_sha256"], x["old_bytes"]):
+            die(f"baseline drift {cid}")
+        if count_cell_pois(cp) != x["new_poi_count"] or count_cell_pois(bp) != x["old_poi_count"]:
+            die(f"candidate/baseline poi_count drift {cid}")
+        if i % 10 == 0 or i == len(inv):
+            log(f"[C2 CANDIDATES {i}/{len(inv)}] PASS")
+
+
+def source_checkpoint_map(source_db: Path) -> dict[str, tuple[str, int]]:
+    if not source_db.is_file():
+        die(f"missing historical source checkpoint DB: {source_db}")
+    uri = source_db.resolve().as_uri() + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True)
+    con.execute("PRAGMA query_only=ON")
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(processed)")}
+        if not {"r2_key", "new_sha256", "new_bytes"}.issubset(cols):
+            die(f"historical processed schema drift: {sorted(cols)}")
+        rows = con.execute("SELECT r2_key,new_sha256,new_bytes FROM processed").fetchall()
+    finally:
+        con.close()
+    out: dict[str, tuple[str, int]] = {}
+    for key, sha, n in rows:
+        name = Path(str(key)).name
+        if name in out:
+            die(f"historical checkpoint duplicate basename: {name}")
+        out[name] = (str(sha).lower(), int(n))
+    if len(out) != EXPECTED_CELLS:
+        die(f"historical processed rows={len(out)} != {EXPECTED_CELLS}")
+    return out
+
+
+def verify_source_staging(source_dir: Path, checkpoint: dict[str, tuple[str, int]], inv: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    if not source_dir.is_dir():
+        die(f"historical source staging missing: {source_dir}")
+    partials = list(source_dir.glob("*.partial")) + list(source_dir.glob("*.regate.partial"))
+    if partials:
+        die(f"historical source staging has partials: {partials[:5]}")
+    files = sorted(source_dir.glob("*.json"))
+    if len(files) != EXPECTED_CELLS:
+        die(f"historical source staging cells={len(files)} != {EXPECTED_CELLS}")
+    if {p.name for p in files} != set(checkpoint):
+        die("historical source staging keyset != checkpoint keyset")
+
+    out: dict[str, dict[str, Any]] = {}
+    t0 = time.time()
+    for i, p in enumerate(files, 1):
+        sha = sha256_file(p)
+        n = p.stat().st_size
+        if (sha, n) != checkpoint[p.name]:
+            die(f"historical source staging drift: {p.name}")
+        pc = count_cell_pois(p)
+        out[p.stem] = {
+            "cell_id": p.stem,
+            "path": str(p.resolve()),
+            "sha256": sha,
+            "bytes": n,
+            "poi_count": pc,
+            "provenance": "SOURCE_CERTIFIED_2026-08-22",
+        }
+        if i % 2000 == 0 or i == len(files):
+            log(f"[SOURCE LOCAL {i}/{len(files)}] {(time.time()-t0):.1f}s")
+
+    for cid, x in inv.items():
+        sx = out.get(cid)
+        if not sx:

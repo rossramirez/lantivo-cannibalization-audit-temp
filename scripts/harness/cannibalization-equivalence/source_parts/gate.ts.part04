@@ -1,0 +1,93 @@
+    const dists: number[] = [];
+    for (const j of cand) {
+      const d = pairDistance(rt, u, units[j]);
+      if (d <= 3000) dists.push(d);
+      if (d <= 60) {
+        const a = Math.min(i,j), b = Math.max(i,j), pk = `${a}:${b}`;
+        if (!seenPairs.has(pk)) { seenPairs.add(pk); collisions.push({ brand: u.brand, unit_a: units[a].unitId, unit_b: units[b].unitId, distance_m: d, exact_zero: d === 0 ? "YES" : "NO", members_a: units[a].members.map(p=>p.id).join("|"), members_b: units[b].members.map(p=>p.id).join("|") }); }
+      }
+    }
+    dists.sort((a,b)=>a-b);
+    const counts: Record<string,number> = {}; for (const r of RADII) counts[String(r)] = dists.filter(d=>d<=r).length;
+    u.nearestM = dists[0] ?? null; u.counts = counts;
+    rows.push({
+      brand: u.brand, opportunity: u.opportunity, unit_id: u.unitId, entity_id: u.entityId ?? "",
+      member_count: u.members.length, member_ids: u.members.map(p=>p.id).sort().join("|"),
+      distance_semantics: "STUDY_DERIVED_MIN_PAIRWISE_MEMBER_HAVERSINE",
+      density_proxy_3x3_001deg: u.densityProxy,
+      density_proxy_member_min: u.densityProxyMin,
+      density_proxy_member_max: u.densityProxyMax,
+      density_assignment_method: "STUDY_DERIVED_MEDIAN_OF_MEMBER_PROXIES",
+      nearest_m: u.nearestM,
+      ...Object.fromEntries(RADII.map(r => [`n_within_${r}m`, counts[String(r)]])),
+    });
+  }
+  return { rows, collisions };
+}
+
+function aggregate(rows: Record<string,any>[]) {
+  const nn = rows.map(r=>Number(r.nearest_m)).filter(Number.isFinite);
+  const out: Record<string,any> = { n: rows.length, p10_nearest_m: qtile(nn,.10), p25_nearest_m: qtile(nn,.25), p50_nearest_m: qtile(nn,.50), p75_nearest_m: qtile(nn,.75), p90_nearest_m: qtile(nn,.90), exact_zero_rate: rows.length ? rows.filter(r=>Number(r.nearest_m)===0).length/rows.length : 0, le10m_rate: rows.length ? rows.filter(r=>Number(r.nearest_m)<=10).length/rows.length : 0, le25m_rate: rows.length ? rows.filter(r=>Number(r.nearest_m)<=25).length/rows.length : 0, le60m_rate: rows.length ? rows.filter(r=>Number(r.nearest_m)<=60).length/rows.length : 0 };
+  for (const rad of RADII) out[`mean_sisters_within_${rad}m`] = rows.length ? rows.reduce((s,r)=>s+Number(r[`n_within_${rad}m`]??0),0)/rows.length : 0;
+  return out;
+}
+
+function hashOutputs(outDir: string, names: string[]) {
+  const lines = names.filter(n=>existsSync(path.join(outDir,n))).sort().map(n=>`${shaFile(path.join(outDir,n))}  ${n}`);
+  atomicWrite(path.join(outDir,"HASHES.txt"), lines.join("\n")+"\n");
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2)); ensureDir(args.outDir);
+  log("=".repeat(100)); log("LANTIVO — IDENTITY/DEDUP + FILTER EQUIVALENCE GATE V1"); log("READ-ONLY RUNTIME/DATA · LOCAL EVIDENCE WRITES ONLY · NO SCORE/POLICY CHANGES"); log("=".repeat(100));
+
+  const guards = guardRuntime(args.runtimeRoot); log(`[PASS] runtime ${guards.head} tree ${guards.tree}`);
+  if (shaFile(args.storeLevel) !== EXPECTED_STORE_SHA) die("STORE_LEVEL SHA drift");
+  const storeRows = parseCsv(readFileSync(args.storeLevel,"utf8"));
+  if (storeRows.length !== EXPECTED_STORE_ROWS) die(`STORE_LEVEL rows ${storeRows.length} != ${EXPECTED_STORE_ROWS}`);
+  const studyIds = new Map<string, Set<string>>();
+  for (const t of TARGETS) studyIds.set(t.brand, new Set());
+  for (const r of storeRows) if (studyIds.has(r.brand)) studyIds.get(r.brand)!.add(r.id);
+  for (const t of TARGETS) if (studyIds.get(t.brand)!.size !== t.expectedStudyN) die(`STORE_LEVEL brand count drift ${t.brand}`);
+
+  const index = JSON.parse(readFileSync(args.snapshotIndex,"utf8")) as SnapshotIndex;
+  if (index.schema !== "LANTIVO_CANNIBALIZATION_EQUIVALENCE_SNAPSHOT_V1" || index.cells.length !== 20_003) die("snapshot index schema/count drift");
+  if (index.authorities.identity.sha256 !== EXPECTED_IDENTITY_SHA) die("snapshot identity SHA drift");
+  const manifest = JSON.parse(readFileSync(index.authorities.manifest.path,"utf8"));
+  if (manifest.brand_overrides_url !== null) die("brand_overrides_url now configured; full layer snapshot required");
+  if (manifest.curated_version !== "2026-07-21-vialnac-nacional-v1") die("curated version drift; non-base scope proof invalid");
+  const identityRaw = JSON.parse(readFileSync(index.authorities.identity.path,"utf8"));
+
+  const rt = await loadRuntime(args.runtimeRoot);
+  const identityDoc = rt.parseIdentityEntityMapDocument(identityRaw); if (!identityDoc) die("runtime rejected certified identity sidecar");
+  const entityById = new Map<string,string>(Object.entries(identityDoc.members) as [string,string][]);
+  const cells = new CellStore(index.cells);
+  const employees = new EmployeeCache(manifest, args.outDir);
+
+  // Pass 1: exact live matchers discover possible target names/home cells while
+  // density proxy is rebuilt from the full active DENUE base (same study definition).
+  const density = new Map<string,number>();
+  const candidateNames = new Set<string>();
+  const directCandidateIds = new Set<string>();
+  const candidateHome = new Set<string>();
+  const preNameOnly = new Map<string, Set<string>>(), preFull = new Map<string, Set<string>>();
+  for (const t of TARGETS) { preNameOnly.set(t.brand,new Set()); preFull.set(t.brand,new Set()); }
+
+  let scannedPois = 0, scannedDenue = 0;
+  for (let ci=0; ci<index.cells.length; ci++) {
+    const meta=index.cells[ci], raw=cells.get(meta.cell_id); scannedPois += raw.length;
+    for (const p of raw) if (p.source === "DENUE") { scannedDenue++; const k=gridKey(p.lat,p.lng,DENSITY_GRID_DEG); density.set(k,(density.get(k)??0)+1); }
+    for (const p of raw) {
+      for (const t of TARGETS) if (nameOnlyMatch(rt,t.brand,p) || fullMatch(rt,t.brand,p)) {
+        const nn = rt.normalizeExactName(p.name);
+        if (nn) candidateNames.add(nn);
+        directCandidateIds.add(p.id);
+        candidateHome.add(meta.cell_id);
+      }
+    }
+    // Filter/match equivalence diagnostic holds dedupe constant by omitting it on both sides.
+    const cleanedNoDedupe = rt.cleanCanonicalCompetitionPois(rt.applyDenueCanonicalAuthority(raw));
+    for (const t of TARGETS) {
+      for (const p of brandMatches(rt,cleanedNoDedupe,t,true)) preNameOnly.get(t.brand)!.add(p.id);
+      for (const p of brandMatches(rt,cleanedNoDedupe,t,false)) preFull.get(t.brand)!.add(p.id);
+    }

@@ -1,0 +1,141 @@
+  "src/lib/radarMergeLayers.ts": "1dce3bb39c753741c61e82d4f6b3c91c5eb952b4",
+  "src/lib/loadRadar.ts": "c2d13f60cd65bd5740fa94a8007de5b83672dcf0",
+  "scripts/build_vialnac_r2.py": "a6e331b5c902d4355adeb918ffb4ee44738eec11",
+  "scripts/extract_vial_tile.py": "c3911d88b1c363711f6c9646dfb92365b1a81319",
+};
+
+function guardRuntime(root: string) {
+  const head = git(root, ["rev-parse", "HEAD"]);
+  if (head !== PINNED_HEAD) die(`runtime HEAD ${head} != pinned ${PINNED_HEAD}`);
+  const tree = git(root, ["rev-parse", "HEAD^{tree}"]);
+  if (tree !== PINNED_TREE) die(`runtime tree ${tree} != pinned ${PINNED_TREE}`);
+  const blobs: Record<string, string> = {};
+  for (const [rel, expected] of Object.entries(EXPECTED_BLOBS)) {
+    const actual = git(root, ["hash-object", rel]);
+    if (actual !== expected) die(`runtime blob drift ${rel}: ${actual} != ${expected}`);
+    blobs[rel] = actual;
+  }
+  return { head, tree, blobs };
+}
+
+async function importTs(root: string, rel: string): Promise<any> {
+  return import(pathToFileURL(path.join(root, rel)).href + `?gate=${encodeURIComponent(PINNED_HEAD)}`);
+}
+
+async function loadRuntime(root: string): Promise<Runtime> {
+  const [dedupe, filters, brands, identity, cells, hav, authority, employees] = await Promise.all([
+    importTs(root, "src/lib/dedupeDenuePois.ts"),
+    importTs(root, "src/lib/directCompetitionFilter.ts"),
+    importTs(root, "src/lib/brandMatching.ts"),
+    importTs(root, "src/lib/identityEntityMap.ts"),
+    importTs(root, "src/lib/cellResolver.ts"),
+    importTs(root, "src/lib/haversineDistance.ts"),
+    importTs(root, "src/lib/denueCanonicalAuthority.ts"),
+    importTs(root, "src/lib/empleadosCellsService.ts"),
+  ]);
+  return {
+    dedupeDenuePois: dedupe.dedupeDenuePois,
+    normalizeExactName: dedupe.normalizeExactName,
+    applyDenueCanonicalAuthority: authority.applyDenueCanonicalAuthority,
+    cleanCanonicalCompetitionPois: filters.cleanCanonicalCompetitionPois,
+    getBrandSearchPois: filters.getBrandSearchPois,
+    matchBrand: brands.matchBrand,
+    parseIdentityEntityMapDocument: identity.parseIdentityEntityMapDocument,
+    isIdentityEntityMapOpportunity: identity.isIdentityEntityMapOpportunity,
+    resolveCellsForPoint: cells.resolveCellsForPoint,
+    resolveHomeCell: cells.resolveHomeCell,
+    haversineDistance: hav.haversineDistance,
+    applyEmpleadosLookup: employees.applyEmpleadosLookup,
+  };
+}
+
+function parseCsv(text: string): Record<string, string>[] {
+  const rows: string[][] = [];
+  let row: string[] = [], field = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false;
+      } else field += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ',') { row.push(field); field = ""; }
+    else if (ch === '\n') { row.push(field.replace(/\r$/, "")); rows.push(row); row = []; field = ""; }
+    else field += ch;
+  }
+  if (field.length || row.length) { row.push(field.replace(/\r$/, "")); rows.push(row); }
+  if (!rows.length) return [];
+  const header = rows[0].map((x, i) => i === 0 ? x.replace(/^\uFEFF/, "") : x);
+  return rows.slice(1).filter(r => r.some(x => x !== "")).map(r => Object.fromEntries(header.map((h, i) => [h, r[i] ?? ""])));
+}
+
+function csvEscape(v: any): string {
+  if (v === null || v === undefined) return "";
+  const s = typeof v === "string" ? v : (typeof v === "object" ? JSON.stringify(v) : String(v));
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+function writeCsv(p: string, rows: Record<string, any>[], fields?: string[]) {
+  const fs = fields ?? (rows[0] ? Object.keys(rows[0]) : []);
+  const body = [fs.join(","), ...rows.map(r => fs.map(f => csvEscape(r[f])).join(","))].join("\r\n") + "\r\n";
+  atomicWrite(p, body);
+}
+
+function qtile(values: number[], p: number): number | null {
+  if (!values.length) return null;
+  const s = [...values].sort((a, b) => a - b);
+  if (s.length === 1) return s[0];
+  const pos = (s.length - 1) * p, lo = Math.floor(pos), hi = Math.ceil(pos);
+  if (lo === hi) return s[lo];
+  const f = pos - lo;
+  return s[lo] * (1 - f) + s[hi] * f;
+}
+function median(values: number[]): number { return qtile(values, .5) ?? 0; }
+function gridKey(lat: number, lng: number, size: number): string { return `${Math.floor(lat / size)}:${Math.floor(lng / size)}`; }
+function parseCellId(cid: string): [number, number] {
+  const m = /^MX_(-?\d+)_(-?\d+)$/.exec(cid);
+  if (!m) die(`invalid cell id ${cid}`);
+  return [Number(m[1]), Number(m[2])];
+}
+function cellSort(a: string, b: string): number {
+  const [ay, ax] = parseCellId(a), [by, bx] = parseCellId(b);
+  return ay - by || ax - bx;
+}
+function cellCenter(cid: string): [number, number] {
+  const [iy, ix] = parseCellId(cid);
+  return [(iy + 0.5) * 0.02, (ix + 0.5) * 0.02];
+}
+
+class CellStore {
+  byId = new Map<string, SnapshotCell>();
+  cache = new Map<string, Poi[]>();
+  maxCache = 256;
+  constructor(cells: SnapshotCell[]) { for (const c of cells) this.byId.set(c.cell_id, c); }
+  get(cid: string): Poi[] {
+    const cached = this.cache.get(cid);
+    if (cached) { this.cache.delete(cid); this.cache.set(cid, cached); return cached; }
+    const meta = this.byId.get(cid);
+    if (!meta) return [];
+    const obj = JSON.parse(readFileSync(meta.path, "utf8"));
+    const list = Array.isArray(obj) ? obj : obj.pois;
+    if (!Array.isArray(list) || obj.cell_id !== cid || Number(obj.poi_count) !== list.length) die(`snapshot cell schema drift ${cid}`);
+    const out = list as Poi[];
+    this.cache.set(cid, out);
+    while (this.cache.size > this.maxCache) this.cache.delete(this.cache.keys().next().value!);
+    return out;
+  }
+}
+
+class EmployeeCache {
+  baseUrl: string | null;
+  version: string | null;
+  dir: string;
+  mem = new Map<string, Map<string, number>>();
+  constructor(manifest: any, outDir: string) {
+    this.baseUrl = typeof manifest.denue_empleados_cells_url === "string" ? manifest.denue_empleados_cells_url : null;
+    this.version = typeof manifest.denue_empleados_version === "string" ? manifest.denue_empleados_version : null;
+    this.dir = path.join(outDir, "EMPLOYEE_CELL_CACHE"); ensureDir(this.dir);
+  }
+  async cell(cid: string): Promise<Map<string, number>> {
+    const hit = this.mem.get(cid); if (hit) return hit;
+    const fp = path.join(this.dir, `${cid}.json`), miss = path.join(this.dir, `${cid}.missing`);
+    let obj: any = {};

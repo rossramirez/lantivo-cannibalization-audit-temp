@@ -1,0 +1,126 @@
+        names = [ln.strip() for ln in cell_list.read_text(encoding="utf-8-sig").splitlines() if ln.strip()]
+        names = [x if x.endswith(".json") else x + ".json" for x in names]
+    else:
+        source_dir = root / "GASOLINERAS_SCIAN_REBUILD_V1" / "staging" / "cells"
+        names = sorted(p.name for p in source_dir.glob("*.json")) if source_dir.is_dir() else []
+    if len(names) != EXPECTED_CELLS or len(set(names)) != EXPECTED_CELLS:
+        die(f"public-snapshot needs exact {EXPECTED_CELLS} unique cell names; got {len(names)}/{len(set(names))}")
+    return sorted(names)
+
+
+def build_public_snapshot(root: Path, out_dir: Path, cell_list: Path | None, workers: int) -> dict[str, Any]:
+    authorities = verify_public_authorities(out_dir)
+    names = load_cell_names(root, cell_list)
+    cache = out_dir / "public_cells"
+    cache.mkdir(parents=True, exist_ok=True)
+
+    def one(name: str) -> dict[str, Any]:
+        target = cache / name
+        if target.is_file():
+            try:
+                pc = count_cell_pois(target)
+                return {
+                    "cell_id": target.stem, "path": str(target.resolve()),
+                    "sha256": sha256_file(target), "bytes": target.stat().st_size,
+                    "poi_count": pc, "provenance": "PUBLIC_GET_ACTIVE_BASE",
+                }
+            except Exception:
+                target.unlink(missing_ok=True)
+        url = EXPECTED_BASE_URL + urllib.parse.quote(name)
+        body = http_get(url)
+        tmp = target.with_name(target.name + ".partial")
+        tmp.write_bytes(body)
+        pc = count_cell_pois(tmp, Path(name).stem)
+        if parse_json_bytes(body, name).get("cell_id") != Path(name).stem:
+            die(f"public cell_id mismatch {name}")
+        os.replace(tmp, target)
+        return {
+            "cell_id": target.stem, "path": str(target.resolve()),
+            "sha256": sha256_bytes(body), "bytes": len(body),
+            "poi_count": pc, "provenance": "PUBLIC_GET_ACTIVE_BASE",
+        }
+
+    rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, 12))) as ex:
+        futs = {ex.submit(one, n): n for n in names}
+        done = 0
+        for fut in as_completed(futs):
+            rows.append(fut.result())
+            done += 1
+            if done % 500 == 0 or done == len(futs):
+                log(f"[PUBLIC GET {done}/{len(futs)}]")
+    rows.sort(key=lambda x: x["cell_id"])
+    return {
+        "schema": "LANTIVO_CANNIBALIZATION_EQUIVALENCE_SNAPSHOT_V1",
+        "script_version": SCRIPT_VERSION,
+        "mode": "public-snapshot",
+        "remote_access": "GET_ONLY",
+        "active_base_version": EXPECTED_BASE_VERSION,
+        "active_base_url": EXPECTED_BASE_URL,
+        "expected_cells": EXPECTED_CELLS,
+        "authorities": authorities,
+        "cells": rows,
+    }
+
+
+def write_hashes(out_dir: Path) -> None:
+    names = [
+        "LIVE_MANIFEST.json", "C2_SUCCESS.json", "IDENTITY_ENTITY_MAP.json",
+        "SNAPSHOT_INDEX.json", "SNAPSHOT_REPORT.json",
+    ]
+    lines = []
+    for name in names:
+        p = out_dir / name
+        if p.is_file():
+            lines.append(f"{sha256_file(p)}  {name}")
+    atomic_write(out_dir / "HASHES.txt", ("\n".join(lines) + "\n").encode("utf-8"))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=SCRIPT_VERSION)
+    ap.add_argument("--root", type=Path, default=Path(r"E:\LANTIVO_DENUE_NACIONAL"))
+    ap.add_argument("--out-dir", type=Path, default=Path(r"E:\LANTIVO_DENUE_NACIONAL\CANNIBALIZATION_EQUIVALENCE_GATE_V1\SNAPSHOT"))
+    ap.add_argument("--mode", choices=("local-certified", "public-snapshot"), default="local-certified")
+    ap.add_argument("--cell-list", type=Path, default=None)
+    ap.add_argument("--workers", type=int, default=8)
+    args = ap.parse_args()
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    log("=" * 96)
+    log("LANTIVO — CANIBALIZATION EQUIVALENCE GATE V1 — SNAPSHOT PREPARE")
+    log("REMOTE READ-ONLY: HTTP GET ONLY · LOCAL CHECKPOINT/ARTIFACT WRITES ONLY")
+    log("=" * 96)
+    log(f"mode: {args.mode}")
+    log(f"root: {args.root}")
+    log(f"out : {args.out_dir}")
+
+    started = time.time()
+    if args.mode == "local-certified":
+        index = build_local_certified(args.root, args.out_dir)
+    else:
+        index = build_public_snapshot(args.root, args.out_dir, args.cell_list, args.workers)
+
+    index_path = args.out_dir / "SNAPSHOT_INDEX.json"
+    atomic_json(index_path, index)
+    report = {
+        "schema": "LANTIVO_CANNIBALIZATION_EQUIVALENCE_SNAPSHOT_REPORT_V1",
+        "verdict": "PASS_SNAPSHOT_PREPARED",
+        "mode": args.mode,
+        "cells": len(index["cells"]),
+        "active_base_version": index["active_base_version"],
+        "identity_sha256": index["authorities"]["identity"]["sha256"],
+        "manifest_sha256": index["authorities"]["manifest"]["sha256"],
+        "success_sha256": index["authorities"]["success"]["sha256"],
+        "remote_write_operations": 0,
+        "http_methods": ["GET"],
+        "elapsed_seconds": round(time.time() - started, 3),
+    }
+    atomic_json(args.out_dir / "SNAPSHOT_REPORT.json", report)
+    write_hashes(args.out_dir)
+    log(json.dumps(report, ensure_ascii=False, indent=2))
+    log("SNAPSHOT PREPARE COMPLETE — NO REMOTE WRITE WAS PERFORMED")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

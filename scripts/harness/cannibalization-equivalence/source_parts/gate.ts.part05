@@ -1,0 +1,78 @@
+    if ((ci+1)%2000===0 || ci+1===index.cells.length) log(`[SCAN ${ci+1}/${index.cells.length}] POIs=${scannedPois.toLocaleString()} DENUE=${scannedDenue.toLocaleString()} candidateHomes=${candidateHome.size}`);
+  }
+
+  const matchDeltaRows: Record<string,any>[] = [], filterDeltaRows: Record<string,any>[] = [];
+  for (const t of TARGETS) {
+    const m=setDelta(preNameOnly.get(t.brand)!,preFull.get(t.brand)!);
+    for (const id of m.aOnly) matchDeltaRows.push({brand:t.brand,side:"NAME_ONLY_STUDY_SEMANTICS_ONLY",id});
+    for (const id of m.bOnly) matchDeltaRows.push({brand:t.brand,side:"RUNTIME_NAME_PLUS_BRAND_ONLY",id});
+    const f=setDelta(studyIds.get(t.brand)!,preNameOnly.get(t.brand)!);
+    for (const id of f.aOnly) filterDeltaRows.push({brand:t.brand,side:"STUDY_STORE_LEVEL_ONLY",id});
+    for (const id of f.bOnly) filterDeltaRows.push({brand:t.brand,side:"RUNTIME_FILTERED_NAME_ONLY_ONLY",id});
+  }
+
+  // Runtime-window nationalization: same 5x5 cell resolver, same 2km radius cut,
+  // employee enrichment, exact dedupe A+B, canonical authority, clean filters,
+  // getBrandSearchPois and matchBrand. Retain only home-cell survivors to avoid
+  // counting one local window repeatedly in the national tiled construction.
+  const windowFinal = new Map<string,Map<string,Poi>>(), windowAOnly = new Map<string,Map<string,Poi>>();
+  for (const t of TARGETS) { windowFinal.set(t.brand,new Map()); windowAOnly.set(t.brand,new Map()); }
+  const contextRows: Record<string,any>[] = [];
+  const homes=[...candidateHome].sort(cellSort);
+  for (let hi=0; hi<homes.length; hi++) {
+    const home=homes[hi], [clat,clng]=cellCenter(home), refs=rt.resolveCellsForPoint(clat,clng,RUNTIME_RADIUS_M).map(x=>x.id);
+    const merged: Poi[]=[];
+    for (const cid of refs) for (const p of cells.get(cid)) { const d=rt.haversineDistance(clat,clng,p.lat,p.lng); if (d<=RUNTIME_RADIUS_M) merged.push({...p,distance_m:d}); }
+    const emp=await employees.merged(refs), enriched=rt.applyEmpleadosLookup(merged,emp);
+    const a=rt.dedupeDenuePois(enriched,7.5,-1), ab=rt.dedupeDenuePois(enriched,7.5);
+    const cleanA=rt.cleanCanonicalCompetitionPois(rt.applyDenueCanonicalAuthority(a));
+    const cleanAB=rt.cleanCanonicalCompetitionPois(rt.applyDenueCanonicalAuthority(ab));
+    for (const t of TARGETS) {
+      const aMatches=brandMatches(rt,cleanA,t,false).filter(p=>rt.resolveHomeCell(p.lat,p.lng).id===home);
+      const abMatches=brandMatches(rt,cleanAB,t,false).filter(p=>rt.resolveHomeCell(p.lat,p.lng).id===home);
+      for (const p of aMatches) windowAOnly.get(t.brand)!.set(p.id,p);
+      for (const p of abMatches) windowFinal.get(t.brand)!.set(p.id,p);
+      const as=new Set(aMatches.map(p=>p.id)), bs=new Set(abMatches.map(p=>p.id)), d=setDelta(as,bs);
+      if (d.aOnly.length||d.bOnly.length) contextRows.push({home_cell:home,brand:t.brand,comparison:"RULE_A_ONLY_VS_RULE_A_PLUS_B",a_only:d.aOnly.join("|"),ab_only:d.bOnly.join("|")});
+    }
+    if ((hi+1)%250===0 || hi+1===homes.length) log(`[WINDOW ${hi+1}/${homes.length}] employeeCache=${employees.mem.size}`);
+  }
+
+  // Global relevant-name diagnostic: exact dedupe can only interact within exact
+  // normalized-name buckets, so collect every active POI whose name belongs to a
+  // bucket discovered by the live matcher. This is NOT used as runtime truth; it
+  // exists solely to expose context/order dependence versus the tiled 5x5 result.
+  const relevant: Poi[]=[]; const relevantCells=new Set<string>();
+  for (const meta of index.cells) for (const p of cells.get(meta.cell_id)) {
+    const nn = rt.normalizeExactName(p.name);
+    if (directCandidateIds.has(p.id) || (nn && candidateNames.has(nn))) { relevant.push({...p}); relevantCells.add(meta.cell_id); }
+  }
+  const globalEmp=await employees.merged([...relevantCells]);
+  const globalEnriched=rt.applyEmpleadosLookup(relevant,globalEmp);
+  const globalDedup=rt.dedupeDenuePois(globalEnriched,7.5);
+  const globalClean=rt.cleanCanonicalCompetitionPois(rt.applyDenueCanonicalAuthority(globalDedup));
+  const globalFinal=new Map<string,Map<string,Poi>>();
+  const dedupeAuditRows: Record<string,any>[]=[]; let contextDeltaTotal=0;
+  for (const t of TARGETS) {
+    const gm=new Map(brandMatches(rt,globalClean,t,false).map(p=>[p.id,p] as const)); globalFinal.set(t.brand,gm);
+    const win=windowFinal.get(t.brand)!; const d=setDelta(new Set(win.keys()),new Set(gm.keys())); contextDeltaTotal += d.aOnly.length+d.bOnly.length;
+    for (const id of d.aOnly) contextRows.push({home_cell:"NATIONAL",brand:t.brand,comparison:"WINDOW_TILED_VS_GLOBAL_RELEVANT_NAME",side:"WINDOW_ONLY",id});
+    for (const id of d.bOnly) contextRows.push({home_cell:"NATIONAL",brand:t.brand,comparison:"WINDOW_TILED_VS_GLOBAL_RELEVANT_NAME",side:"GLOBAL_ONLY",id});
+    const aSet=new Set(windowAOnly.get(t.brand)!.keys()), abSet=new Set(win.keys()), dab=setDelta(aSet,abSet);
+    dedupeAuditRows.push({brand:t.brand,study_n:studyIds.get(t.brand)!.size,pre_dedupe_runtime_name_only_n:preNameOnly.get(t.brand)!.size,pre_dedupe_runtime_name_brand_n:preFull.get(t.brand)!.size,window_rule_a_only_n:aSet.size,window_rule_a_plus_b_n:abSet.size,rule_b_absorbed_delta:dab.aOnly.length,rule_b_added_survivor_delta:dab.bOnly.length,global_relevant_name_n:gm.size,window_vs_global_symmetric_delta:d.aOnly.length+d.bOnly.length});
+  }
+
+  const allUnits: Unit[]=[]; const identityAudit: Record<string,any>[]=[]; const shadow3b: any[]=[];
+  for (const t of TARGETS) { const built=buildUnits(rt,windowFinal.get(t.brand)!,t,entityById,density); allUnits.push(...built.units); identityAudit.push(built.audit); if(built.shadow3b) shadow3b.push({brand:t.brand,...built.shadow3b}); }
+  const proxies=allUnits.map(u=>u.densityProxy), d25=qtile(proxies,.25)!, d50=qtile(proxies,.50)!, d75=qtile(proxies,.75)!;
+  for (const u of allUnits) u.densityStratum = u.densityProxy<=d25?"Q1_baja":u.densityProxy<=d50?"Q2_media_baja":u.densityProxy<=d75?"Q3_media_alta":"Q4_alta";
+
+  const spacingRows: Record<string,any>[]=[], collisionRows: Record<string,any>[]=[];
+  for (const t of TARGETS) {
+    const units=allUnits.filter(u=>u.brand===t.brand); const {rows,collisions}=computeSpacing(rt,units);
+    for (const r of rows) { const u=units.find(x=>x.unitId===r.unit_id)!; r.density_stratum=u.densityStratum; }
+    spacingRows.push(...rows); collisionRows.push(...collisions);
+  }
+
+  const brandSummary: Record<string,any>[]=[], densitySummary: Record<string,any>[]=[];
+  for (const t of TARGETS) {
