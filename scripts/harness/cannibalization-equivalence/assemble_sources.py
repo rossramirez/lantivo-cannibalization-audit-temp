@@ -5,7 +5,7 @@ from pathlib import Path
 
 EXPECTED = {
     "prepare_snapshot.py": "77c36c0b39a97b99893990420f1c8564b109296d2e47a7006c510d55815d02ad",
-    "gate.ts": "8700e4411de74db142c4c4895fb73756b25b4a4637b7c304913490183f93f170",
+    "gate.ts": "29c8b3f117ce4cb5380248ab96259827c3093be648cd2f57d84ffdaa8e034a5a",
 }
 
 def sha256(b: bytes) -> str:
