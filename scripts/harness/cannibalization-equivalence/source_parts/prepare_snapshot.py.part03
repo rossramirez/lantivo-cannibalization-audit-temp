@@ -85,6 +85,8 @@ def verify_public_authorities(out_dir: Path) -> dict[str, Any]:
 
 
 def build_local_certified(root: Path, out_dir: Path) -> dict[str, Any]:
+    authorities = verify_public_authorities(out_dir)
+
     prep_dir = root / "C2_BASE_REPAIR_PREPARE_V1_3"
     source_work = root / "GASOLINERAS_SCIAN_REBUILD_V1"
     source_dir = source_work / "staging" / "cells"
@@ -112,7 +114,6 @@ def build_local_certified(root: Path, out_dir: Path) -> dict[str, Any]:
     if sum(1 for x in active.values() if x["provenance"].startswith("C2_CANDIDATE")) != EXPECTED_AFFECTED_CELLS:
         die("active reconstructed affected-cell count drift")
 
-    authorities = verify_public_authorities(out_dir)
     index = {
         "schema": "LANTIVO_CANNIBALIZATION_EQUIVALENCE_SNAPSHOT_V1",
         "script_version": SCRIPT_VERSION,
