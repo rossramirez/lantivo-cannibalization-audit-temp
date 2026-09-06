@@ -12,7 +12,7 @@
   writeCsv(path.join(args.outDir,"MATCH_DELTA.csv"),matchDeltaRows,["brand","side","id"]);
   writeCsv(path.join(args.outDir,"FILTER_DELTA.csv"),filterDeltaRows,["brand","side","id"]);
   writeCsv(path.join(args.outDir,"DEDUPE_AUDIT.csv"),dedupeAuditRows);
-  writeCsv(path.join(args.outDir,"DEDUPE_CONTEXT_DELTA.csv"),contextRows);
+  writeCsv(path.join(args.outDir,"DEDUPE_CONTEXT_DELTA.csv"),contextRows,["home_cell","brand","comparison","a_only","ab_only","side","id"]);
   writeCsv(path.join(args.outDir,"IDENTITY_AUDIT.csv"),identityRows);
   writeCsv(path.join(args.outDir,"COORDINATE_COLLISIONS.csv"),collisionRows);
   writeCsv(path.join(args.outDir,"EMPLOYEE_CACHE_AUDIT.csv"),employeeAudit);
