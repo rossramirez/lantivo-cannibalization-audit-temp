@@ -4,7 +4,7 @@ import argparse, hashlib, os
 from pathlib import Path
 
 EXPECTED = {
-    "prepare_snapshot.py": "5773db9905d5efd81c58bc6ad90ee652d73ac555bd99514217def396fed23698",
+    "prepare_snapshot.py": "77c36c0b39a97b99893990420f1c8564b109296d2e47a7006c510d55815d02ad",
     "gate.ts": "8700e4411de74db142c4c4895fb73756b25b4a4637b7c304913490183f93f170",
 }
 
