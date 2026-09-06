@@ -115,7 +115,10 @@ class CellStore {
     if (cached) { this.cache.delete(cid); this.cache.set(cid, cached); return cached; }
     const meta = this.byId.get(cid);
     if (!meta) return [];
-    const obj = JSON.parse(readFileSync(meta.path, "utf8"));
+    const body = readFileSync(meta.path);
+    const actualSha = shaBytes(body);
+    if (actualSha !== meta.sha256) die(`snapshot cell SHA drift ${cid}: ${actualSha} != ${meta.sha256}`);
+    const obj = JSON.parse(body.toString("utf8"));
     const list = Array.isArray(obj) ? obj : obj.pois;
     if (!Array.isArray(list) || obj.cell_id !== cid || Number(obj.poi_count) !== list.length) die(`snapshot cell schema drift ${cid}`);
     const out = list as Poi[];
