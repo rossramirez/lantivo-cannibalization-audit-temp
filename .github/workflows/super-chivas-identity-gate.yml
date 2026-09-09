@@ -1,0 +1,22 @@
+name: Super Chivas Identity-Only Gate
+
+on:
+  push:
+    branches:
+      - audit/super-chivas-identity-gate-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout audit-temp branch
+        uses: actions/checkout@v4
+      - name: Node version
+        run: node --version
+      - name: Run independent read-only gate
+        run: node SUPER_CHIVAS_IDENTITY_ONLY_GATE.mjs
