@@ -1,0 +1,19 @@
+name: Super Chivas Delta Precision Recheck V2
+
+on:
+  push:
+    branches:
+      - audit/super-chivas-identity-gate-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recheck-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run corrected independent national-method recheck
+        run: node SUPER_CHIVAS_GATE_METHOD_RECHECK_V2.mjs
